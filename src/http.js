@@ -57,6 +57,7 @@ export const VERSION = (() => {
 export const BASE_PATH = "/api/tokenledger";
 export const USAGE_PATH = `${BASE_PATH}/usage`;
 export const BALANCE_PATH = `${BASE_PATH}/balance`;
+export const SYNC_PATH = `${BASE_PATH}/sync-zcode`;
 export const ACCOUNTS_PATH = `${BASE_PATH}/accounts`;
 
 /**
@@ -96,8 +97,11 @@ export function hostNameOf(header) {
  * @returns `undefined` when the request is acceptable, otherwise
  *   `{ status, body }` to send back.
  */
-export function screenRequest(req) {
-	if (req?.method !== "GET") return { status: 405, body: { ok: false, error: "method-not-allowed" } };
+export function screenRequest(req, path) {
+	const allowed =
+		req?.method === "GET" ||
+		(req?.method === "POST" && path === SYNC_PATH);
+	if (!allowed) return { status: 405, body: { ok: false, error: "method-not-allowed" } };
 	const peerOk = isLoopbackAddress(req.socket?.remoteAddress);
 	const hostOk = isLoopbackAddress(hostNameOf(req.headers?.host));
 	// Both, and the peer address is the one that cannot be forged.
@@ -338,7 +342,7 @@ function attachRoutes(ctx, httpServer, deps) {
 					kind: "exact",
 					path,
 					handler: async (req, res) => {
-						const refused = screenRequest(req);
+						const refused = screenRequest(req, path);
 						if (refused !== undefined) return send(res, refused.status, refused.body);
 						try {
 							send(res, 200, await build(parseQuery(req.url), req.url));
@@ -363,6 +367,31 @@ function attachRoutes(ctx, httpServer, deps) {
 			BALANCE_PATH,
 			async (query, url) => deps.balance(accountOf(url)),
 			"tokenledger balance route"
+		);
+	}
+
+	// ZCode 手动同步端点。POST-only，仍走回环双检（peer + host）——
+	// 与 usage/balance 同一道防线，只是方法不同：同步是有副作用的操作。
+	if (typeof deps.syncZcode === "function") {
+		ctx.effect(
+			() =>
+				webServer.register({
+					kind: "exact",
+					path: SYNC_PATH,
+					handler: async (req, res) => {
+						const refused = screenRequest(req, SYNC_PATH);
+						if (refused !== undefined) return send(res, refused.status, refused.body);
+						if (req?.method !== "POST") return send(res, 405, { ok: false, error: "method-not-allowed" });
+						try {
+							const result = await deps.syncZcode();
+							send(res, 200, { ok: true, ...result });
+						} catch (error) {
+							logger?.warn?.("tokenledger: zcode sync failed: %s", error?.message ?? error);
+							send(res, 500, { ok: false, error: "sync-failed" });
+						}
+					}
+				}),
+			"tokenledger zcode sync route"
 		);
 	}
 

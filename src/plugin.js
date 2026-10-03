@@ -204,7 +204,11 @@ export async function sweep(persistence, store, options = {}) {
 
 	let snapshots;
 	try {
-		snapshots = await persistence.listSnapshots();
+		// 0.1.5-rc.2 renamed the surface: listSnapshots → list. Feature-detect
+		// so one plugin copy serves both harness lines.
+		snapshots = typeof persistence.list === "function"
+			? await persistence.list()
+			: await persistence.listSnapshots();
 	} catch (error) {
 		logger?.warn?.("tokenledger: could not list sessions: %s", error?.message ?? error);
 		stats.failed++;
@@ -243,9 +247,18 @@ export async function sweep(persistence, store, options = {}) {
 			// the ledger. Existing checkpoints already point past the prefix; only a
 			// session's first read needs to start at the durable seed boundary.
 			const fromSeq = checkpoint === undefined
-				? (snapshot.header?.seedLength ?? 0)
+				? (snapshot.header?.seedLength ?? snapshot.header?.inheritedEventCount ?? 0)
 				: state.consumedSeq + 1;
-			const { events } = await persistence.readFrom(sessionId, fromSeq);
+			// 0.1.5-rc.2 replaced readFrom(id, seq) with open(id, 'read') plus a
+			// handle-scoped read(offset). Feature-detect between the two lines.
+			let events;
+			if (typeof persistence.readFrom === "function") {
+				({ events } = await persistence.readFrom(sessionId, fromSeq));
+			} else {
+				const handle = await persistence.open(sessionId, "read");
+				({ events } = await handle.read(fromSeq));
+				if (typeof handle.close === "function") await handle.close();
+			}
 			if ((events?.length ?? 0) === 0) {
 				stats.skipped++;
 				continue;
@@ -956,6 +969,13 @@ export function apply(ctx, userConfig = {}) {
 					return config.endpoints;
 				}
 			}),
+			// Manual ZCode sync: the toolbar's Sync button hits this over the
+			// loopback route, which runs every usage bridge once and folds
+			// whatever new rows they recorded since the last sync.
+			async syncZcode() {
+				const { runBridgeSync } = await import("./zcode-bridge.js");
+				return runBridgeSync();
+			},
 			logger
 		});
 		if (!served) logger?.info?.("tokenledger: no web server in this composition; the panel will not be served");

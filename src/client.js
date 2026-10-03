@@ -102,6 +102,7 @@ window.__ModuleLoader__.load({
 		const NS = "tokenLedger";
 		const USAGE_PATH = "/api/tokenledger/usage";
 		const BALANCE_PATH = "/api/tokenledger/balance";
+		const SYNC_PATH = "/api/tokenledger/sync-zcode";
 		/** A year of whole weeks; must match the host's window or the strip has holes. */
 		const ACTIVITY_DAYS = 371;
 
@@ -178,6 +179,9 @@ window.__ModuleLoader__.load({
 			".tkl_iconButton{cursor:pointer;width:26px;height:26px;color:var(--dsw-alias-label-tertiary);background:0 0;border:none;border-radius:var(--tkl-radius-xs);justify-content:center;align-items:center;padding:0;display:inline-flex}",
 			".tkl_iconButton:hover{color:var(--dsw-alias-label-secondary);background:var(--dsw-alias-interactive-bg-hover)}",
 			".tkl_iconButton[data-busy]{opacity:.5;cursor:default}",
+			".tkl_zcodeButton{cursor:pointer;height:26px;color:var(--dsw-alias-label-secondary);background:var(--dsw-alias-interactive-bg-subtle);border:1px solid var(--dsw-alias-border-l2);border-radius:var(--tkl-radius-xs);align-items:center;padding:0 8px;display:inline-flex;font-size:11px;font-weight:500;line-height:1}",
+			".tkl_zcodeButton:hover{background:var(--dsw-alias-interactive-bg-hover)}",
+			".tkl_zcodeButton[data-busy]{opacity:.6;cursor:default}",
 			".tkl_body{flex:1;min-height:0;padding:12px 14px 14px;overflow-y:auto}",
 			".tkl_note{color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:18px;margin:0}",
 			".tkl_error{color:var(--dsw-alias-state-error-primary);font-size:12px;line-height:18px;margin:0}",
@@ -1550,6 +1554,21 @@ window.__ModuleLoader__.load({
 			const state = useUsage(open, days, site, nonce);
 			const balance = useBalance(open, account, nonce);
 			const reload = () => setNonce((n) => n + 1);
+			const [zcodeBusy, setZcodeBusy] = react.useState(false);
+			const syncZcode = () => {
+				if (zcodeBusy) return;
+				setZcodeBusy(true);
+				fetch(SYNC_PATH, { method: "POST", headers: { "content-type": "application/json", accept: "application/json" }, body: "{}" })
+					.then((r) => r.json().catch(() => ({})))
+					.then((body) => {
+						if (body?.ok === false) console.warn("[tokenledger] zcode sync failed:", body?.error);
+					})
+					.catch((error) => console.warn("[tokenledger] zcode sync error:", error?.message ?? error))
+					.finally(() => {
+						setZcodeBusy(false);
+						reload();
+					});
+			};
 			const translate = translateWith(t);
 
 			// Escape and a click anywhere else both close, and both listeners exist
@@ -1618,6 +1637,18 @@ window.__ModuleLoader__.load({
 											children: [
 													jsx("button", {
 													type: "button",
+													className: S.zcodeButton,
+													...(zcodeBusy ? { "data-busy": "" } : {}),
+													title: translate("action.syncZcode"),
+													"aria-label": translate("action.syncZcode"),
+													onClick: () => {
+														if (zcodeBusy) return;
+														void syncZcode();
+													},
+													children: translate("action.syncZcode")
+												}),
+												jsx("button", {
+													type: "button",
 													className: S.iconButton,
 													...(busy ? { "data-busy": "" } : {}),
 													"aria-label": translate("action.refresh"),
@@ -1655,6 +1686,7 @@ window.__ModuleLoader__.load({
 			"range.month": "本月",
 			"range.all": "累计",
 			"action.refresh": "刷新",
+			"action.syncZcode": "同步",
 			"action.close": "关闭",
 			"action.retry": "重试",
 			"state.loading": "读取中…",
@@ -1751,6 +1783,7 @@ window.__ModuleLoader__.load({
 			"range.month": "This month",
 			"range.all": "All time",
 			"action.refresh": "Refresh",
+			"action.syncZcode": "Sync",
 			"action.close": "Close",
 			"action.retry": "Retry",
 			"state.loading": "Loading…",
