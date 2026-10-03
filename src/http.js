@@ -36,6 +36,7 @@
 import { createRequire } from "node:module";
 
 import { describeProject } from "./projects.js";
+import { DEEPSEEK_OFFICIAL_RATES, RateTable, priceRows } from "./pricing.js";
 import { dailyModels, dayKey, fromDaysAgo, hostTimeZone, monthStart } from "./usage.js";
 
 /**
@@ -59,6 +60,14 @@ export const USAGE_PATH = `${BASE_PATH}/usage`;
 export const BALANCE_PATH = `${BASE_PATH}/balance`;
 export const SYNC_PATH = `${BASE_PATH}/sync-zcode`;
 export const ACCOUNTS_PATH = `${BASE_PATH}/accounts`;
+/**
+ * The one route that WRITES, and what it writes is the plugin's own settings
+ * namespace: the per-origin New API console credentials the 设置余额 dialog
+ * edits. Its POST is the single exception to this surface's read-only rule —
+ * the fence (loopback peer + host) is identical, the body is size-capped, and
+ * nothing here ever echoes the token back.
+ */
+export const USERAUTH_PATH = `${BASE_PATH}/userauth`;
 
 /**
  * How many days the activity strip covers: a full year of whole weeks.
@@ -91,17 +100,31 @@ export function hostNameOf(header) {
 	return colon === -1 ? header : header.slice(0, colon);
 }
 
+/** The path a request addresses, without the query. */
+export function pathOf(url) {
+	try {
+		return new URL(url ?? "/", "http://localhost").pathname;
+	} catch {
+		return "";
+	}
+}
+
 /**
  * Decide whether a request may be served.
  *
  * @returns `undefined` when the request is acceptable, otherwise
  *   `{ status, body }` to send back.
  */
-export function screenRequest(req, path) {
-	const allowed =
-		req?.method === "GET" ||
-		(req?.method === "POST" && path === SYNC_PATH);
-	if (!allowed) return { status: 405, body: { ok: false, error: "method-not-allowed" } };
+export function screenRequest(req) {
+	const path = pathOf(req?.url);
+	const method = req?.method;
+	// POST exists for exactly two routes — the credentials dialog and the
+	// manual bridge sync. Everywhere else the surface stays read-only, and an
+	// unexpected POST is refused before the loopback fence is even consulted.
+	const methodOk =
+		method === "GET" ||
+		(method === "POST" && (path === USERAUTH_PATH || path === SYNC_PATH));
+	if (!methodOk) return { status: 405, body: { ok: false, error: "method-not-allowed" } };
 	const peerOk = isLoopbackAddress(req.socket?.remoteAddress);
 	const hostOk = isLoopbackAddress(hostNameOf(req.headers?.host));
 	// Both, and the peer address is the one that cannot be forged.
@@ -117,6 +140,65 @@ export function accountOf(url) {
 	} catch {
 		return undefined;
 	}
+}
+
+/**
+ * `?force=1` on a balance request — the panel's refresh button asking the
+ * wallet to skip its freshness window. A backoff is never bypassed by this;
+ * the throttle is the one thing the cache exists to respect.
+ */
+export function forceOf(url) {
+	try {
+		const value = new URL(url ?? "/", "http://localhost").searchParams.get("force");
+		return value === "1" || value === "true";
+	} catch {
+		return false;
+	}
+}
+
+/** The origin a userauth request names, or undefined when absent. */
+export function originOf(url) {
+	try {
+		const value = new URL(url ?? "/", "http://localhost").searchParams.get("origin");
+		return value === null || value === "" ? undefined : value;
+	} catch {
+		return undefined;
+	}
+}
+
+/** Cap for the credentials POST body; two integers and a token fit in far less. */
+export const USERAUTH_BODY_LIMIT = 4096;
+
+/**
+ * Read a request body as JSON, with a hard byte ceiling.
+ *
+ * Resolves `undefined` for an empty body and throws `payload-too-large` past
+ * the cap — the dialog's payload is two short fields, so anything larger is
+ * not the dialog.
+ */
+export function readJsonBody(req, limit = USERAUTH_BODY_LIMIT) {
+	return new Promise((resolve, reject) => {
+		const chunks = [];
+		let size = 0;
+		req.on("data", (chunk) => {
+			size += chunk.length;
+			if (size > limit) {
+				reject(Object.assign(new Error("payload-too-large"), { kind: "payload-too-large" }));
+				req.destroy();
+				return;
+			}
+			chunks.push(chunk);
+		});
+		req.on("end", () => {
+			if (chunks.length === 0) return resolve(undefined);
+			try {
+				resolve(JSON.parse(Buffer.concat(chunks).toString("utf8")));
+			} catch {
+				reject(Object.assign(new Error("invalid-json"), { kind: "invalid-json" }));
+			}
+		});
+		req.on("error", reject);
+	});
 }
 
 /** Parse `?days=` / `?site=` into the range the store queries take. */
@@ -136,17 +218,40 @@ export function parseQuery(url) {
 }
 
 /**
+ * Today's cost, the figure the sidebar badge shows next to today's tokens.
+ *
+ * Priced with the configured rates when present, the shipped DeepSeek official
+ * list otherwise — the same default the panel's `priced` column uses. Only the
+ * official provider's rows are priced: a relay site sets its own prices, so
+ * guessing them from the official list would print a confident wrong figure.
+ * `null` when nothing priced ran today, which the badge renders as tokens
+ * alone.
+ *
+ * @returns `{ cost, currency }` or `null`.
+ */
+export function priceToday(store, site = undefined, rates = undefined) {
+	const day = dayKey(Date.now());
+	const rows = store.byRoute({ from: day }, site).filter((row) => row.provider === "deepseek-official");
+	if (rows.length === 0) return null;
+	const table = rates === undefined ? new RateTable(DEEPSEEK_OFFICIAL_RATES) : new RateTable(rates);
+	const priced = priceRows(rows, table, day);
+	const entries = Object.entries(priced.totals);
+	if (entries.length === 0) return null;
+	return { cost: entries[0][1], currency: entries[0][0] };
+}
+
+/**
  * Build the whole panel payload in one read.
  *
  * One request rather than six: the panel renders as a unit, and six requests
  * would let its sections disagree with each other while they land.
  *
- * @param deps - `{ store, sites, priced, projectTitles }`.
- * @param query - `{ range, site }` from {@link parseQuery}.
+ * @param deps - `{ store, sites, priced, todayPriced, projectTitles }`.
+ * @param query - `{ range, site, provider? }`; HTTP {@link parseQuery} omits provider.
  */
 export function usagePayload(deps, query) {
 	const { store, sites, priced } = deps;
-	const { range, site } = query;
+	const { range, site, provider } = query;
 	return {
 		ok: true,
 		// So "is my install current?" is answerable in one request. Several rounds
@@ -161,35 +266,40 @@ export function usagePayload(deps, query) {
 		timeZone: hostTimeZone(),
 		range,
 		site,
-		totals: store.totals(range, site),
-		days: store.byDay(range, site),
+		...(provider === undefined ? {} : { provider }),
+		totals: store.totals(range, site, provider),
+		days: store.byDay(range, site, provider),
 		// The three windows the panel shows side by side, each a whole figure
 		// rather than a slice of the selected range: "today" and "this month" and
 		// "all time" are the questions people actually ask, and reading them off
 		// one selector means changing it three times.
 		windows: {
-			today: store.totals({ from: dayKey(Date.now()) }, site),
-			month: store.totals({ from: monthStart() }, site),
-			all: store.totals({}, site)
+			today: store.totals({ from: dayKey(Date.now()) }, site, provider),
+			month: store.totals({ from: monthStart() }, site, provider),
+			all: store.totals({}, site, provider)
 		},
+		// What today's tokens cost, for the sidebar badge. Independent of the
+		// selected range, like `windows.today` — the badge answers "today" even
+		// when the panel is looking at last month.
+		todayCost: deps.todayPriced?.(site) ?? null,
 		// The activity strip has its OWN window, deliberately. Tied to the
 		// selected range it collapsed to a single cell whenever "today" was
 		// picked — a heatmap of one day is not a heatmap, and it read as broken.
-		activity: store.byDay({ from: fromDaysAgo(ACTIVITY_DAYS) }, site),
+		activity: store.byDay({ from: fromDaysAgo(ACTIVITY_DAYS) }, site, provider),
 		// Per-day, per-model rows for the same window, so hovering a cell can
 		// show what ran that day rather than only how much. Sent with the panel
 		// rather than fetched per hover: a request on mouseover would lag behind
 		// the pointer, and these are counts, not content.
-		activityModels: dailyModels(store.byRoute({ from: fromDaysAgo(ACTIVITY_DAYS) }, site)),
-		models: store.byModel(range, site),
+		activityModels: dailyModels(store.byRoute({ from: fromDaysAgo(ACTIVITY_DAYS) }, site, provider)),
+		models: store.byModel(range, site, provider),
 		// Site rows are never filtered by the current selection: the breakdown is
 		// how you CHANGE that selection, so hiding the others would strand you.
-		sites: store.bySite(range),
+		sites: store.bySite(range, provider),
 		// Which project burned it — keyed on the directory the session ran in,
 		// labelled with the workspace title when there is one. See `projects.js`
 		// for why the directory is the key and the workspace only the label.
-		projects: store.byProject(range, site).map((row) => ({ ...row, ...describeProject(row.project, deps.projectTitles?.().get(row.project)) })),
-		providers: store.byProvider(range, site),
+		projects: store.byProject(range, site, provider).map((row) => ({ ...row, ...describeProject(row.project, deps.projectTitles?.().get(row.project)) })),
+		providers: store.byProvider(range, site, provider),
 		// Configured/discovered sites carry the routes and software behind each
 		// row, which the totals alone cannot say.
 		directory: (sites?.() ?? []).map((s) => ({
@@ -207,7 +317,7 @@ export function usagePayload(deps, query) {
 		// exactly right.
 		lastSweepAt: deps.lastSweepAt?.(),
 		diagnostics: store.diagnostics(),
-		priced: priced?.(range, site) ?? null
+		priced: priced?.(range, site, provider) ?? null
 	};
 }
 
@@ -365,7 +475,11 @@ function attachRoutes(ctx, httpServer, deps) {
 	if (typeof deps.balance === "function") {
 		route(
 			BALANCE_PATH,
-			async (query, url) => deps.balance(accountOf(url)),
+			// `?origin=` (no `account=`) marks a WARM request: the browser fires
+			// one per configured site at page load, so the first panel open
+			// finds the host's cache already hot. Passive — freshness and the
+			// throttle backoff govern it like any other read.
+			async (query, url) => deps.balance(accountOf(url), forceOf(url), originOf(url)),
 			"tokenledger balance route"
 		);
 	}
@@ -375,11 +489,11 @@ function attachRoutes(ctx, httpServer, deps) {
 	if (typeof deps.syncZcode === "function") {
 		ctx.effect(
 			() =>
-				webServer.register({
+				httpServer.register({
 					kind: "exact",
 					path: SYNC_PATH,
 					handler: async (req, res) => {
-						const refused = screenRequest(req, SYNC_PATH);
+						const refused = screenRequest(req);
 						if (refused !== undefined) return send(res, refused.status, refused.body);
 						if (req?.method !== "POST") return send(res, 405, { ok: false, error: "method-not-allowed" });
 						try {
@@ -394,6 +508,48 @@ function attachRoutes(ctx, httpServer, deps) {
 			"tokenledger zcode sync route"
 		);
 	}
+
+	// The credentials route, in one registration: the webserver's contract is
+	// that a route OWNS its path and handles every method itself ("routes own
+	// their method handling"), so GET and POST dispatch inside the handler —
+	// a second exact registration on the same path would fight this one.
+	//
+	// GET answers what the dialog may SHOW about stored credentials: that they
+	// exist and which user id they carry. The token itself is never in that
+	// answer — a GET that echoed a secret would make every devtools session a
+	// credential leak. POST saves or clears one origin's entry; the fence ran
+	// in `screenRequest`, the body is capped, and a failure lands here as a
+	// plain status the dialog can print.
+	if (typeof deps.userAuth === "function" || typeof deps.saveUserAuth === "function") {
+		ctx.effect(
+			() =>
+				httpServer.register({
+					kind: "exact",
+					path: USERAUTH_PATH,
+					handler: async (req, res) => {
+						const refused = screenRequest(req);
+						if (refused !== undefined) return send(res, refused.status, refused.body);
+						try {
+							if (req.method === "POST" && typeof deps.saveUserAuth === "function") {
+								const body = await readJsonBody(req);
+								await deps.saveUserAuth(body);
+								return send(res, 200, { ok: true });
+							}
+							if (req.method === "GET" && typeof deps.userAuth === "function") {
+								return send(res, 200, { ok: true, origins: deps.userAuth(originOf(req.url)) });
+							}
+							send(res, 405, { ok: false, error: "method-not-allowed" });
+						} catch (error) {
+							const status = error?.kind === "payload-too-large" || error?.kind === "invalid-json" ? 400 : 500;
+							logger?.warn?.("tokenledger: %s failed: %s", USERAUTH_PATH, error?.message ?? error);
+							send(res, status, { ok: false, error: error?.kind ?? "internal" });
+						}
+					}
+				}),
+			"tokenledger userauth route"
+		);
+	}
+
 
 	return true;
 }

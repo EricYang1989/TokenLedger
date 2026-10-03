@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { BASE_PATH, USAGE_PATH, hostNameOf, isLoopbackAddress, parseQuery, registerRoutes, screenRequest, usagePayload } from "../src/http.js";
+import { BALANCE_PATH, BASE_PATH, USAGE_PATH, USERAUTH_PATH, accountOf, forceOf, hostNameOf, isLoopbackAddress, originOf, parseQuery, readJsonBody, registerRoutes, screenRequest, usagePayload } from "../src/http.js";
 import { dailyModels, hostTimeZone } from "../src/usage.js";
 import { LedgerStore } from "../src/store.js";
 import { applyUsageDelta } from "../src/usage.js";
@@ -113,6 +113,26 @@ test("the site breakdown ignores the current filter, because it is how you chang
 		const p = usagePayload({ store, sites: () => [] }, { range: {}, site: "nowhere" });
 		assert.ok(p.sites.some((s) => s.site === "api.relay-one.example"), "filtering the breakdown strands the user");
 		assert.equal(p.totals.outputTokens, 0, "but the totals do honour it");
+	} finally {
+		store.close();
+	}
+});
+
+test("a provider route filters every usage section as one account cut", () => {
+	const store = seeded();
+	try {
+		const selected = usagePayload({ store, sites: () => [] }, { range: {}, provider: "api99" });
+		assert.equal(selected.provider, "api99");
+		assert.equal(selected.totals.outputTokens, 100);
+		assert.equal(selected.days[0].outputTokens, 100);
+		assert.equal(selected.activity[0].outputTokens, 100);
+		assert.equal(selected.models[0].outputTokens, 100);
+		assert.equal(selected.projects[0].outputTokens, 100);
+		assert.deepEqual(selected.sites.map((row) => row.site), ["api.relay-one.example"]);
+
+		const absent = usagePayload({ store, sites: () => [] }, { range: {}, provider: "other-route" });
+		assert.equal(absent.totals.tokens, 0);
+		for (const key of ["days", "activity", "models", "projects", "providers", "sites"]) assert.deepEqual(absent[key], []);
 	} finally {
 		store.close();
 	}
@@ -342,4 +362,110 @@ test("a host that has never swept reports no read time rather than a wrong one",
 	} finally {
 		store.close();
 	}
+});
+
+// --- the one writing route ---------------------------------------------------
+//
+// POST exists for exactly one path — the 设置余额 dialog saving New API console
+// credentials. Everywhere else this surface stays read-only, and the loopback
+// fence applies to the writer with the same force as to the readers.
+
+test("POST is served only on the userauth route, and only from loopback", () => {
+	assert.equal(screenRequest(req({ method: "POST", url: USERAUTH_PATH })), undefined);
+	assert.equal(screenRequest(req({ method: "POST", url: USAGE_PATH }))?.status, 405);
+	assert.equal(screenRequest(req({ method: "POST", url: BALANCE_PATH }))?.status, 405);
+	assert.equal(
+		screenRequest(req({ method: "POST", url: USERAUTH_PATH, socket: { remoteAddress: "203.0.113.9" } }))?.status,
+		403,
+		"the write crosses the same fence as the reads"
+	);
+	assert.equal(screenRequest(req({ method: "PUT", url: USERAUTH_PATH }))?.status, 405);
+});
+
+test("balance query parsing separates the account from the force flag", () => {
+	assert.equal(forceOf(`${BALANCE_PATH}?account=r&force=1`), true);
+	assert.equal(forceOf(`${BALANCE_PATH}?account=r`), false);
+	assert.equal(forceOf(BALANCE_PATH), false);
+	assert.equal(accountOf(`${BALANCE_PATH}?account=r&force=1`), "r");
+	assert.equal(originOf(`${USERAUTH_PATH}?origin=${encodeURIComponent("https://r.example")}`), "https://r.example");
+});
+
+test("a POST body larger than the dialog could ever need is refused", async () => {
+	const { PassThrough } = await import("node:stream");
+	const big = new PassThrough();
+	big.end("x".repeat(5000));
+	await assert.rejects(readJsonBody(big), (error) => error.kind === "payload-too-large");
+
+	const fine = new PassThrough();
+	fine.end(JSON.stringify({ origin: "https://r.example", userId: 42, token: "t" }));
+	assert.deepEqual(await readJsonBody(fine), { origin: "https://r.example", userId: 42, token: "t" });
+});
+
+test("the credentials route owns its path: GET shows state, POST writes, the token never echoes", async () => {
+	const registered = [];
+	const ctx = { get: () => ({ register: (s) => void registered.push(s) }), effect: (fn) => fn() };
+	const saved = [];
+	registerRoutes(ctx, {
+		store: {},
+		sites: () => [],
+		userAuth: () => ({ "https://r.example": { userId: 42, hasToken: true } }),
+		saveUserAuth: async (body) => void saved.push(body)
+	});
+	const auth = registered.find((r) => r.path === USERAUTH_PATH);
+	assert.notEqual(auth, undefined);
+	assert.equal(registered.filter((r) => r.path === USERAUTH_PATH).length, 1, "one route owns the path");
+
+	// GET: state only — hasToken, never the token itself.
+	const sent = [];
+	const res = { writeHead: (s) => sent.push(s), end: (body) => sent.push(body) };
+	await auth.handler(req({ url: `${USERAUTH_PATH}?origin=${encodeURIComponent("https://r.example")}` }), res);
+	assert.equal(sent[0], 200);
+	const payload = JSON.parse(sent[1]);
+	assert.deepEqual(payload.origins["https://r.example"], { userId: 42, hasToken: true });
+	assert.equal(sent[1].includes("tok"), false, "no credential crosses back out");
+
+	// POST: the parsed body reaches saveUserAuth, and the answer is ok.
+	const { PassThrough } = await import("node:stream");
+	const postReq = (body) => {
+		const stream = new PassThrough();
+		stream.end(body);
+		return Object.assign(stream, {
+			method: "POST",
+			url: USERAUTH_PATH,
+			headers: { host: "127.0.0.1" },
+			socket: { remoteAddress: "127.0.0.1" }
+		});
+	};
+	const posted = [];
+	await auth.handler(postReq(JSON.stringify({ origin: "https://r.example", userId: 42, token: "tok" })), res);
+	assert.deepEqual(saved, [{ origin: "https://r.example", userId: 42, token: "tok" }]);
+	assert.equal(sent[sent.length - 2], 200);
+	assert.equal(JSON.parse(sent[sent.length - 1]).ok, true);
+
+	// A saver that refuses answers 500 with its reason, not a crash.
+	const failing = [];
+	const failSent = [];
+	const failCtx = { get: () => ({ register: (s) => void failing.push(s) }), effect: (fn) => fn() };
+	registerRoutes(failCtx, {
+		store: {},
+		sites: () => [],
+		saveUserAuth: async () => {
+			throw new Error("settings-not-ready");
+		},
+		logger: { warn() {} }
+	});
+	const res2 = { writeHead: (s) => failSent.push(s), end: (body) => failSent.push(body) };
+	const stream2 = new PassThrough();
+	stream2.end("{}");
+	const writeRoute = failing.find((r) => r.path === USERAUTH_PATH);
+	await writeRoute.handler(
+		Object.assign(stream2, {
+			method: "POST",
+			url: USERAUTH_PATH,
+			headers: { host: "127.0.0.1" },
+			socket: { remoteAddress: "127.0.0.1" }
+		}),
+		res2
+	);
+	assert.equal(failSent[0], 500);
 });

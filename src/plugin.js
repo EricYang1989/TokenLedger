@@ -15,9 +15,10 @@
  *
  * ## Why it sweeps rather than subscribing
  *
- * `sessionPersistence.listSnapshots()` returns an opaque per-log revision that
+ * `sessionPersistence.list()` returns an opaque per-log revision that
  * changes on append, so a sweep can skip every unchanged session without
- * parsing it, and `readFrom(id, seq)` reads only the tail. Subscribing to live
+ * parsing it, and a read handle opened with `open(id, "read")` reads the log.
+ * Subscribing to live
  * events instead would put this code on the hot path and lose everything
  * written while the plugin was not running — a restart would silently under-
  * count. Sweeping is idempotent and self-healing; subscribing is neither.
@@ -33,15 +34,19 @@
  * @module dsh-tokenledger/plugin
  */
 
-import { DIRECT, UNKNOWN, UNROUTED, applyUsageDelta, dayKey } from "./usage.js";
-import { RelaySiteRegistry, SITE_TYPES, createSiteResolver, domainOf } from "./relay-sites.js";
+import { DIRECT, UNKNOWN, UNROUTED, applyUsageDelta, createUsageState, dayKey } from "./usage.js";
+import { RelaySiteRegistry, SITE_TYPES, createSiteResolver, domainOf, normalizeOrigin } from "./relay-sites.js";
 import { createFingerprintRegistry } from "./fingerprints.js";
 import { describeProject, readProjectTitles, workspaceRegistry } from "./projects.js";
 import { discoverFromContext, mergeSites, withKnownSoftware } from "./discovery.js";
 import { createBalanceReader, listAccounts } from "./balance.js";
-import { VERSION, registerRoutes } from "./http.js";
+import { createNewApiWalletReader, shouldUseWallet } from "./newapi-user.js";
+import { VERSION, priceToday, registerRoutes, usagePayload } from "./http.js";
+import { DashboardController, DashboardControllerError } from "./dashboard-controller.js";
+import { mountTokenLedgerBlue } from "./blue/index.js";
+
 import { LedgerStore } from "./store.js";
-import { RateTable, priceRows } from "./pricing.js";
+import { DEEPSEEK_OFFICIAL_RATES, RateTable, priceRows } from "./pricing.js";
 import { num, renderReport, table } from "./report.js";
 
 /** `YYYY-MM-DD` for N days before today, in local time. */
@@ -50,16 +55,21 @@ function dayKeyDaysAgo(daysBack) {
 }
 
 /**
- * Price the range with rates from configuration.
+ * Price the range with rates from configuration, falling back to the shipped
+ * DeepSeek official list.
  *
  * Rates live in config rather than in code because a relay sets its own
  * prices; shipping a table would be shipping one site's deal as everyone's.
+ * But the official route is the default install, and a report whose cost
+ * column is all em dashes until the user writes a price table reads as
+ * broken. The official list prices the deepseek models only; anything else
+ * stays unpriced (`null`, never zero). A user-supplied `rates` always wins.
  */
-function priceWithConfiguredRates(store, range, site, rates) {
+function priceWithConfiguredRates(store, range, site, rates, provider = undefined) {
 	try {
-		const table = new RateTable(rates);
+		const table = new RateTable(rates === undefined ? DEEPSEEK_OFFICIAL_RATES : rates);
 		const day = range.to ?? range.from ?? dayKey(Date.now());
-		return priceRows(store.byModel(range, site), table, day);
+		return priceRows(store.byModel(range, site, provider), table, day);
 	} catch {
 		// A malformed rate table costs the cost column, not the report.
 		return null;
@@ -100,7 +110,8 @@ export const inject = ["sessionPersistence"];
 const DEFAULTS = {
 	database: "tokenledger.sqlite",
 	sweepIntervalMs: 60_000,
-	sweepOnStart: true
+	sweepOnStart: true,
+	commandEnabled: true
 };
 
 /**
@@ -204,11 +215,15 @@ export async function sweep(persistence, store, options = {}) {
 
 	let snapshots;
 	try {
-		// 0.1.5-rc.2 renamed the surface: listSnapshots → list. Feature-detect
-		// so one plugin copy serves both harness lines.
-		snapshots = typeof persistence.list === "function"
-			? await persistence.list()
-			: await persistence.listSnapshots();
+		// The harness reworked this seam on 2026-08-28 (`bec6805d6a`,
+		// handle-based session persistence): `listSnapshots()` became `list()`.
+		// Prefer the new name and keep the old one as a fallback, so a host on
+		// either side of that change lists its sessions.
+		const listSessions = persistence.list ?? persistence.listSnapshots;
+		if (typeof listSessions !== "function") {
+			throw new Error("sessionPersistence exposes neither list() nor listSnapshots()");
+		}
+		snapshots = await listSessions.call(persistence);
 	} catch (error) {
 		logger?.warn?.("tokenledger: could not list sessions: %s", error?.message ?? error);
 		stats.failed++;
@@ -240,24 +255,44 @@ export async function sweep(persistence, store, options = {}) {
 				continue;
 			}
 
-			const state = store.loadState(sessionId);
-			// A fork's durable log starts with a copy of its parent's event prefix.
-			// DSH records the exclusive end of that inherited prefix as seedLength.
-			// Counting it again under the child's session id makes every fork inflate
-			// the ledger. Existing checkpoints already point past the prefix; only a
-			// session's first read needs to start at the durable seed boundary.
-			const fromSeq = checkpoint === undefined
-				? (snapshot.header?.seedLength ?? snapshot.header?.inheritedEventCount ?? 0)
-				: state.consumedSeq + 1;
-			// 0.1.5-rc.2 replaced readFrom(id, seq) with open(id, 'read') plus a
-			// handle-scoped read(offset). Feature-detect between the two lines.
+			// The handle-based seam reads the log through `open(id, "read")`;
+			// `readFrom(id, seq)` is gone with it. The v1→v2 session migration
+			// also RENUMBERS event seqs, so a checkpoint's `consumedSeq` can
+			// overshoot the renumbered log and yield an empty tail while unread
+			// events remain — the session would silently never be counted
+			// again. A moved revision therefore re-reads the whole log and
+			// re-folds it from scratch; `commitSession` replaces the session's
+			// rows wholesale, so the full fold cannot double count.
 			let events;
-			if (typeof persistence.readFrom === "function") {
-				({ events } = await persistence.readFrom(sessionId, fromSeq));
-			} else {
+			let state;
+			if (typeof persistence.open === "function") {
 				const handle = await persistence.open(sessionId, "read");
-				({ events } = await handle.read(fromSeq));
-				if (typeof handle.close === "function") await handle.close();
+				try {
+					({ events } = await handle.read(0));
+				} finally {
+					await handle.close();
+				}
+				// A fork's durable log starts with a copy of its parent's event
+				// prefix; DSH records the exclusive end of that inherited prefix
+				// as seedLength. A full re-read sees the prefix again, so the
+				// fold starts past it — counting it under the child's session id
+				// would inflate every fork's ledger.
+				const seedLength = snapshot.header?.seedLength ?? 0;
+				events = (events ?? []).filter((event) => (event.seq ?? 0) >= seedLength);
+				state = createUsageState();
+			} else {
+				// The pre-handle seam still reads a tail. A fork's durable log
+				// starts with a copy of its parent's event prefix. DSH records
+				// the exclusive end of that inherited prefix as seedLength.
+				// Counting it again under the child's session id makes every fork
+				// inflate the ledger. Existing checkpoints already point past the
+				// prefix; only a session's first read needs to start at the
+				// durable seed boundary.
+				state = store.loadState(sessionId);
+				const fromSeq = checkpoint === undefined
+					? (snapshot.header?.seedLength ?? 0)
+					: state.consumedSeq + 1;
+				({ events } = await persistence.readFrom(sessionId, fromSeq));
 			}
 			if ((events?.length ?? 0) === 0) {
 				stats.skipped++;
@@ -609,9 +644,9 @@ function routeAttributionReport(store, directory) {
 /**
  * Cordis plugin entry.
  *
- * Publishes `ctx.tokenLedger` so a UI row or a tool can read the index without
- * reopening the database, and disposes both the timer and the store with the
- * fiber.
+ * Preserves the legacy `ctx.tokenLedger` service and optionally mounts the Blue
+ * adapter. The dashboard controller, timer, caches, and store remain owned by
+ * this one plugin Fiber.
  */
 export function apply(ctx, userConfig = {}) {
 	const config = { ...DEFAULTS, ...userConfig };
@@ -632,6 +667,8 @@ export function apply(ctx, userConfig = {}) {
 		logger?.error?.("tokenledger: could not open %s: %s", config.database, error?.message ?? error);
 		return;
 	}
+	let dashboardController;
+	const walletReader = createNewApiWalletReader();
 
 	// --- the site directory -------------------------------------------------
 	//
@@ -661,6 +698,7 @@ export function apply(ctx, userConfig = {}) {
 		// already succeeded.
 		onLearn: (software) => {
 			directory = { ...directory, sites: withKnownSoftware(directory.sites, software) };
+			dashboardController?.notifyChanged();
 		}
 	});
 
@@ -788,6 +826,7 @@ export function apply(ctx, userConfig = {}) {
 	// dynamically and its absence costs exactly itself.
 	let settingsScope;
 	let settingsRemove;
+	let settingsRemoveUserAuth;
 	let settingsFailure;
 
 	// `settings` is WAITED FOR, not sampled.
@@ -809,6 +848,9 @@ export function apply(ctx, userConfig = {}) {
 			scoped.on?.("dispose", () => {
 				live = false;
 				settingsScope = undefined;
+				settingsRemove = undefined;
+				settingsRemoveUserAuth = undefined;
+				dashboardController?.notifyChanged(true);
 			});
 			void import("./settings-schema.js")
 				.then(({ registerNamespace }) =>
@@ -817,6 +859,7 @@ export function apply(ctx, userConfig = {}) {
 								// A resolved value replaces the entry config wholesale;
 								// the directory picks the change up on the next sweep.
 								Object.assign(config, next);
+								dashboardController?.notifyChanged(true);
 							})
 						: undefined
 				)
@@ -824,12 +867,14 @@ export function apply(ctx, userConfig = {}) {
 					if (!live || registered === undefined) return;
 					settingsScope = registered.scope;
 					settingsRemove = registered.remove;
+					settingsRemoveUserAuth = registered.removeUserAuth;
 					settingsFailure = undefined;
 					// Relay discovery reads provider profiles THROUGH this service, so
 					// the sweep that ran at startup — before the service existed — found
 					// nothing. Re-discover now instead of leaving the directory empty
 					// until the next timer tick.
 					refreshDirectory();
+					dashboardController?.notifyChanged(true);
 					logger?.info?.("tokenledger: settings namespace registered; configuration can be saved");
 				})
 				.catch((error) => {
@@ -837,6 +882,7 @@ export function apply(ctx, userConfig = {}) {
 					// different, and a message that names the wrong one sends whoever
 					// reads it to the wrong place.
 					settingsFailure = error?.message ?? String(error);
+					dashboardController?.notifyChanged(true);
 					logger?.warn?.(
 						"tokenledger: could not register the settings namespace (%s); using entry config only",
 						settingsFailure
@@ -847,67 +893,54 @@ export function apply(ctx, userConfig = {}) {
 		settingsFailure = "这个 Cordis 没有 ctx.inject";
 	}
 
-	const api = {
+	// The original public face is a published compatibility contract. Keep its
+	// identity and behavior unchanged while new renderers migrate to the bounded
+	// the internal dashboard controller below; in particular, this legacy object still exposes
+	// the store because removing it here would turn an additive migration into a
+	// breaking release.
+	const legacyApi = {
 		store,
 		sweep: runSweep,
 		totals: (range, site) => store.totals(range, site),
 		byDay: (range, site) => store.byDay(range, site),
 		byModel: (range, site) => store.byModel(range, site),
 		bySite: (range) => store.bySite(range),
-		sites: () => directory.sites.map((s) => ({ ...s })),
+		sites: () => directory.sites.map((site) => ({ ...site })),
 		diagnostics: () => store.diagnostics(),
-		/** Discard the index; the next sweep rebuilds it from seq 0. */
 		reindex: async () => {
 			store.reset();
 			return runSweep();
 		}
 	};
-
-	// Cordis refuses a bare assignment to an undeclared service ("cannot set
-	// property without provide"). Publishing is a convenience for a UI row or a
-	// tool, not a prerequisite for collecting, so an upstream rc that moves this
-	// API costs the service and nothing else.
 	try {
 		if (typeof ctx.reflect?.provide === "function") {
-			ctx.reflect.provide("tokenLedger", api);
+			ctx.reflect.provide("tokenLedger", legacyApi);
 		} else {
-			logger?.warn?.("tokenledger: no reflect.provide on this Cordis; collecting without publishing a service");
+			logger?.warn?.("tokenledger: no reflect.provide on this Cordis; collecting without publishing services");
 		}
 	} catch (error) {
-		logger?.warn?.("tokenledger: could not publish the service: %s", error?.message ?? error);
+		logger?.warn?.("tokenledger: could not publish the legacy service: %s", error?.message ?? error);
 	}
 
-	// `/tokenledger [days] [site]` — a report in the conversation stream. The
-	// command is a shell over the same queries the future UI page will use, so
-	// nothing here is throwaway when that page lands.
-	const commands = typeof ctx.get === "function" ? ctx.get("commands") : undefined;
-	if (commands !== undefined) {
-		try {
-			ctx.effect(function* () {
-				yield commands.register({
-					name: config.commandName ?? "tokenledger",
-					description: "Token usage by model and relay site",
-					input: { hint: "[days] [site] | site | export [csv] | diagnostics | reindex" },
-					handler: async (invocation) => {
-						try {
-							return { kind: "success", text: await handleCommand(invocation.rawInput ?? "") };
-						} catch (error) {
-							return { kind: "error", text: `tokenledger: ${error?.message ?? error}` };
-						}
-					}
-				});
-			}, "tokenledger command");
-		} catch (error) {
-			logger?.warn?.("tokenledger: could not register the command: %s", error?.message ?? error);
-		}
-	}
+	/** Sweep and replay the changed summary to renderer-neutral consumers. */
+	const runSweepAndPublish = async () => {
+		const result = await runSweep();
+		dashboardController?.notifyChanged();
+		return result;
+	};
+
+	/** Discard the derived index; the next sweep rebuilds it from seq 0. */
+	const reindexAndPublish = async () => {
+		store.reset();
+		return runSweepAndPublish();
+	};
 
 	const handleCommand = (rawInput) =>
 		runCommand(rawInput, {
 			store,
 			config,
-			sweep: runSweep,
-			reindex: api.reindex,
+			sweep: runSweepAndPublish,
+			reindex: reindexAndPublish,
 			logger,
 			sites: () => directory.sites,
 			// The whole directory, not just its sites: diagnostics needs the
@@ -919,58 +952,208 @@ export function apply(ctx, userConfig = {}) {
 			probeStatus: fingerprints.status,
 			// Present only once the namespace registered; `runCommand` says so
 			// rather than failing, because the report half still works without it.
-			saveRelays:
-				settingsScope === undefined
-					? undefined
-					: async (relays) => {
+				saveRelays:
+					settingsScope === undefined
+						? undefined
+						: async (relays) => {
 							await settingsScope.update({ relays });
 							refreshDirectory();
+							dashboardController?.notifyChanged(true);
 						},
-			removeRelay:
-				settingsRemove === undefined
-					? undefined
-					: async (route) => {
+				removeRelay:
+					settingsRemove === undefined
+						? undefined
+						: async (route) => {
 							await settingsRemove(route);
 							refreshDirectory();
+							dashboardController?.notifyChanged(true);
 						},
 			saveUnavailableBecause: settingsFailure
 		});
 
+	// The legacy command is the plain fallback. A live Blue adapter temporarily
+	// owns the same name and restores this effect when its host service unloads.
+	let legacyCommandEffect;
+	let disposing = false;
+	const stopLegacyCommand = () => {
+		const dispose = legacyCommandEffect;
+		legacyCommandEffect = undefined;
+		if (typeof dispose === "function") void dispose();
+	};
+	const startLegacyCommand = () => {
+		if (disposing || config.commandEnabled === false || legacyCommandEffect !== undefined || typeof ctx.get !== "function") return;
+		const commands = ctx.get("commands");
+		if (commands === undefined || typeof commands.register !== "function") return;
+		try {
+			legacyCommandEffect = ctx.effect(() => commands.register({
+				name: config.commandName ?? "tokenledger",
+				description: "Token usage by model and relay site",
+				input: { hint: "[days] [site] | site | export [csv] | diagnostics | reindex" },
+				handler: async (invocation) => {
+					try {
+						return { kind: "success", text: await handleCommand(invocation.rawInput ?? "") };
+					} catch (error) {
+						return { kind: "error", text: `tokenledger: ${error?.message ?? error}` };
+					}
+				}
+			}), "tokenledger legacy command");
+		} catch (error) {
+			logger?.warn?.("tokenledger: could not register the command: %s", error?.message ?? error);
+		}
+	};
+	startLegacyCommand();
+
 	// The read-only surface the browser panel reads. Registering it is optional
 	// in both directions: a composition with no web server keeps collecting, and
 	// a deployment that never opens the panel pays only for the registration.
+	//
+	// The balance read is wrapped, not replaced: an origin whose 设置余额 entry
+	// exists reads the USER WALLET (per-user, adaptive-cache, no key query to
+	// spend the site's rate budget on), and every other account falls through
+	// to the per-key readers exactly as before.
+	let balance;
+
+	/** The stored credentials as a renderer may SEE them: never the token. */
+	const userAuth = (origin) => {
+		const all = config.userAuth ?? {};
+		const view = (entry) => ({
+			userId: typeof entry?.userId === "number" ? entry.userId : undefined,
+			hasToken: typeof entry?.token === "string" && entry.token !== ""
+		});
+		if (origin !== undefined) {
+			const hit = all[origin];
+			return hit === undefined ? {} : { [origin]: view(hit) };
+		}
+		return Object.fromEntries(Object.entries(all).map(([key, entry]) => [key, view(entry)]));
+	};
+
+	/** Save or clear one origin's entry through the existing settings seam. */
+	const saveUserAuth = async (body) => {
+		if (body === null || typeof body !== "object") throw new Error("invalid-body");
+		const origin = normalizeOrigin(body.origin);
+		if (origin === undefined) throw new Error("invalid-origin");
+		if (body.remove === true) {
+			if (settingsRemoveUserAuth === undefined) throw new Error("settings-not-ready");
+			await settingsRemoveUserAuth(origin);
+			// Mirror the change now: the settings watch is asynchronous and a read
+			// immediately after this write must not see the removed credential.
+			const next = { ...(config.userAuth ?? {}) };
+			delete next[origin];
+			config.userAuth = next;
+		} else {
+			if (settingsScope === undefined) throw new Error("settings-not-ready");
+			const userId = body.userId;
+			if (typeof userId !== "number" || !Number.isInteger(userId) || userId <= 0) {
+				throw new Error("invalid-user-id");
+			}
+			const previous = config.userAuth?.[origin];
+			const token = typeof body.token === "string" && body.token !== "" ? body.token : previous?.token;
+			if (typeof token !== "string" || token === "") throw new Error("invalid-token");
+			config.userAuth = { ...(config.userAuth ?? {}), [origin]: { userId, token } };
+			await settingsScope.update({ userAuth: config.userAuth });
+		}
+		walletReader.forget(origin);
+		dashboardController?.notifyChanged(true);
+	};
+
 	try {
+		/** The per-key readers, unchanged underneath the wallet override. */
+		const baseBalance = createBalanceReader(ctx, {
+			softwareOf: fingerprints.software,
+			// A lazily detected relay program is remembered, so the probe
+			// happens once per site rather than once per balance read.
+			learnSoftware: fingerprints.learn,
+			// `config.detect`, not a bare `detect`. Lifting the fingerprint
+			// registry out of apply() removed the local binding this used to
+			// close over, and the leftover reference threw a ReferenceError
+			// the moment `registerRoutes` was called — swallowed by the catch
+			// below into a warning nobody reads, so the HTTP routes silently
+			// stopped registering and the panel 404'd for every install after
+			// that refactor.
+			detect: config.detect,
+			// Read through `config` rather than captured once, so editing a
+			// declaration takes effect on the next read instead of at the
+			// next restart — the whole point of registering the namespace.
+			get endpoints() {
+				return config.endpoints;
+			}
+		});
+
+		balance = async (id, force, warmOrigin, request = {}) => {
+			const accounts = listAccounts(ctx, { softwareOf: fingerprints.software });
+			// A WARM request names an origin, not an account: the browser fires
+			// one per configured site at page load, before any account is picked.
+			const account =
+				warmOrigin !== undefined
+					? accounts.find((a) => a.origin === warmOrigin)
+					: id === undefined
+						? accounts[0]
+						: accounts.find((a) => a.id === id);
+			const auth = account === undefined ? undefined : config.userAuth?.[account.origin];
+			if (!shouldUseWallet(account, auth)) {
+				// Warming an account WITHOUT credentials must never fall through
+				// to the per-key read: that spends the site's query budget the
+				// wallet exists to save, and a page load would pay it every time.
+				if (warmOrigin !== undefined) return { ok: true, warmed: false };
+				return baseBalance(id, { signal: request.signal });
+			}
+			try {
+				const card = await walletReader.read({
+					origin: account.origin,
+					userId: auth.userId,
+					token: auth.token,
+					force,
+					signal: request.signal
+				});
+				return { ok: true, account: account.id, displayName: account.displayName, warmed: warmOrigin !== undefined, ...card };
+			} catch (error) {
+				// A throttle with no previous card to show is the only failure the
+				// wallet reports as such; every other refusal keeps its reason.
+				// (A throttle WITH a previous card never gets here — the reader
+				// answers with that card and a stale flag itself.)
+				const reason =
+					error?.kind === "rate-limited"
+						? "rate-limited"
+						: error?.kind === "upstream-auth"
+							? `upstream-${error.status ?? "error"}`
+							: error?.kind === "upstream"
+								? `http-${error.status ?? "error"}`
+								: error?.kind === "timeout"
+									? "timeout"
+									: error?.kind === "invalid-response"
+										? "invalid-response"
+										: "unreachable";
+				return {
+					ok: true,
+					account: account.id,
+					displayName: account.displayName,
+					supported: true,
+					fetched: false,
+					scheme: "newapi",
+					reason,
+					...(error?.retryAt === undefined ? {} : { retryAt: error.retryAt })
+				};
+			}
+		};
+
 		const served = registerRoutes(ctx, {
 			store,
 			sites: () => directory.sites,
-			sweep: runSweep,
-			priced: (range, site) =>
-				config.rates === undefined ? null : priceWithConfiguredRates(store, range, site, config.rates),
+			sweep: runSweepAndPublish,
+			// The panel prices every range: the configured rates when present,
+			// the shipped DeepSeek official list otherwise (deepseek models
+			// only — anything else stays unpriced).
+			priced: (range, site, provider) => priceWithConfiguredRates(store, range, site, config.rates, provider),
+			// The badge's "today" figure, same rate default as `priced`.
+			todayPriced: (site) => priceToday(store, site, config.rates),
 			accounts: () => listAccounts(ctx, { softwareOf: fingerprints.software }),
 			projectTitles: () => projectTitles,
 			lastSweepAt: () => lastSweepAt,
-			balance: createBalanceReader(ctx, {
-				softwareOf: fingerprints.software,
-				// A lazily detected relay program is remembered, so the probe
-				// happens once per site rather than once per balance read.
-				learnSoftware: fingerprints.learn,
-				// `config.detect`, not a bare `detect`. Lifting the fingerprint
-				// registry out of apply() removed the local binding this used to
-				// close over, and the leftover reference threw a ReferenceError
-				// the moment `registerRoutes` was called — swallowed by the catch
-				// below into a warning nobody reads, so the HTTP routes silently
-				// stopped registering and the panel 404'd for every install after
-				// that refactor.
-				detect: config.detect,
-				// Read through `config` rather than captured once, so editing a
-				// declaration takes effect on the next read instead of at the
-				// next restart — the whole point of registering the namespace.
-				get endpoints() {
-					return config.endpoints;
-				}
-			}),
-			// Manual ZCode sync: the toolbar's Sync button hits this over the
-			// loopback route, which runs every usage bridge once and folds
+			balance,
+			userAuth,
+			saveUserAuth,
+			// Manual multi-source sync: the toolbar's Sync button hits this over
+			// the loopback route, which runs every usage bridge once and folds
 			// whatever new rows they recorded since the last sync.
 			async syncZcode() {
 				const { runBridgeSync } = await import("./zcode-bridge.js");
@@ -988,14 +1171,57 @@ export function apply(ctx, userConfig = {}) {
 		logger?.error?.("tokenledger: could not register the HTTP routes: %s", error?.stack ?? error?.message ?? error);
 	}
 
-	if (config.sweepOnStart) void runSweep();
+	const usageDeps = {
+		store,
+		sites: () => directory.sites,
+		priced: (range, site, provider) => priceWithConfiguredRates(store, range, site, config.rates, provider),
+		todayPriced: (site) => priceToday(store, site, config.rates),
+		accounts: () => listAccounts(ctx, { softwareOf: fingerprints.software }),
+		projectTitles: () => projectTitles,
+		lastSweepAt: () => lastSweepAt
+	};
+	const readUsage = (query) => usagePayload(usageDeps, query);
+	try {
+		dashboardController = new DashboardController({
+			readUsage,
+			refresh: async ({ signal }) => {
+				const stats = await runSweep();
+				if (signal.aborted) throw new DashboardControllerError("ABORTED", "Usage refresh was aborted");
+				return stats;
+			},
+			readBalance: async (action, { signal }) => {
+				if (balance === undefined) throw new DashboardControllerError("UNAVAILABLE", "Balance reader is unavailable");
+				const accountId = typeof action.accountId === "string" ? action.accountId.slice(0, 256) : undefined;
+				const data = await balance(accountId, action.force === true, undefined, { signal });
+				if (signal.aborted) throw new DashboardControllerError("ABORTED", "Balance refresh was aborted");
+				return data;
+			},
+			dispose: () => walletReader.dispose()
+		});
+	} catch (error) {
+		logger?.warn?.("tokenledger: could not initialize the Blue dashboard controller: %s", error?.message ?? error);
+	}
+
+	if (dashboardController !== undefined && typeof ctx.inject === "function") {
+		ctx.inject(["bluePluginHost"], (scoped) => {
+			stopLegacyCommand();
+			const mounted = mountTokenLedgerBlue(scoped, dashboardController, { onDispose: startLegacyCommand });
+			if (!mounted) startLegacyCommand();
+		});
+	}
+
+	if (config.sweepOnStart) void runSweepAndPublish();
 
 	const timer =
-		config.sweepIntervalMs > 0 ? setInterval(() => void runSweep(), config.sweepIntervalMs) : undefined;
+		config.sweepIntervalMs > 0 ? setInterval(() => void runSweepAndPublish(), config.sweepIntervalMs) : undefined;
 	timer?.unref?.();
 
-	ctx.on("dispose", () => {
+	ctx.on("dispose", async () => {
+		disposing = true;
+		stopLegacyCommand();
 		if (timer !== undefined) clearInterval(timer);
+		if (dashboardController === undefined) walletReader.dispose();
+		else await dashboardController.dispose();
 		try {
 			store.close();
 		} catch {

@@ -158,17 +158,37 @@ test("everything that floats asks for the overlay ground, with the page ground a
 	// own text. The failure is invisible to us because the default theme leaves
 	// both tokens opaque, so only a test keeps this from being reverted by the
 	// next person who reaches for the token they see everywhere else.
+	//
+	// The floating grounds are now FROSTED — `color-mix` thinning the overlay
+	// colour over a backdrop blur — which still asks the overlay token first
+	// and still falls back to the page ground; the contract is the token
+	// chain, not the literal background declaration.
 	const { dom } = await loadBundle();
 	const css = dom.head.children[0].textContent;
 
-	for (const selector of ["tkl_panel", "tkl_header", "tkl_tip"]) {
+	const overlayGround = /background:[^;]*var\(--dsw-alias-bg-overlay,var\(--dsw-alias-bg-base\)\)/;
+	// The header is NOT in this list any more: it is a child of the frosted
+	// pane and is deliberately transparent, so the pane's ground shows through.
+	for (const selector of ["tkl_panel", "tkl_tip"]) {
 		const rule = css.match(new RegExp(`\\.${selector}\\{[^}]*\\}`))[0];
 		assert.match(
 			rule,
-			/background:var\(--dsw-alias-bg-overlay,var\(--dsw-alias-bg-base\)\)/,
+			overlayGround,
 			`.${selector} floats, so it must not paint itself with the page's ground`
 		);
 	}
+
+	// The pane's solidity follows DSH's 玻璃透明度 setting when the token
+	// exists — and DSH is itself a plugin: older builds and other compositions
+	// never define the token, so the fallback is a built-in frosted default
+	// (90%) rather than an opaque pane. Compatibility first, appearance second.
+	const panel = css.match(/\.tkl_panel\{[^}]*\}/)[0];
+	assert.match(
+		panel,
+		/color-mix\(in srgb,var\(--dsw-alias-bg-overlay,var\(--dsw-alias-bg-base\)\) var\(--dsw-alias-glass-opacity,90%\)/,
+		"solidity follows the appearance slider's token, with a frosted fallback"
+	);
+	assert.equal(/backdrop-filter/.test(panel), false, "no forced blur: DSH's own wallpaper frost governs");
 
 	// The fallback is the whole point: a theme defining no overlay token has to
 	// render exactly as it did before.
@@ -194,6 +214,47 @@ test("the activity ramp is defined for both themes and for an explicit choice", 
 	assert.ok(css.includes("prefers-color-scheme:dark"));
 	assert.ok(css.includes("[data-theme='dark'] .tkl_panel"));
 	assert.ok(css.includes("[data-theme='light'] .tkl_panel"));
+});
+
+test("the account picker's dropdown states its own ground and label", async () => {
+	// The reported bug: the options came up grey-on-grey and unreadable. An
+	// `<option>` is drawn in a native popup OUTSIDE the panel, so it inherits
+	// the select's faint `label-secondary` but none of the panel's ground —
+	// leaving either half to the system menu colour is what produced it.
+	const { dom } = await loadBundle();
+	const css = dom.head.children[0].textContent;
+
+	const option = css.match(/\.tkl_select option\{[^}]*\}/);
+	assert.ok(option, "the popup is unstyled, so it keeps the system menu colour");
+	assert.match(option[0], /background-color:var\(--tkl-option-bg\)/, "an opaque ground of its own");
+	assert.match(option[0], /color:var\(--tkl-option-fg\)/, "and a label that reads on it");
+
+	// Scoped --tkl-* literals rather than --dsw-alias-*: a popup cannot be
+	// translucent, and a skin is free to set the alias grounds to transparent.
+	assert.equal(
+		/--tkl-option-(?:bg|fg):var\(--dsw-alias/.test(css),
+		false,
+		"a token a skin may set to transparent cannot be a popup's ground"
+	);
+
+	// The same blocks the ramp is stated in: a colour defined only inside the
+	// media query is wrong the moment a user picks the opposite theme.
+	for (const [scope, rule] of [
+		["the default", /\.tkl_panel\{[^}]*\}/],
+		["the system's dark", /@media \(prefers-color-scheme:dark\)\{\.tkl_panel\{[^}]*\}/],
+		["an explicit dark", /\[data-theme='dark'\] \.tkl_panel\{[^}]*\}/],
+		["an explicit light", /\[data-theme='light'\] \.tkl_panel\{[^}]*\}/]
+	]) {
+		const block = css.match(rule)[0];
+		for (const token of ["--tkl-option-bg", "--tkl-option-fg", "--tkl-scheme"]) {
+			assert.ok(block.includes(token), `${token} is undefined under ${scope} theme`);
+		}
+	}
+
+	// The popup's own frame — border, scrollbar, the highlighted row — is the
+	// browser's, and `color-scheme` is the only thing it consults for it.
+	const select = css.match(/\.tkl_select\{[^}]*\}/)[0];
+	assert.match(select, /color-scheme:var\(--tkl-scheme/, "or the popup's frame ignores the theme");
 });
 
 test("apply registers dictionaries and the footer seat", async () => {
@@ -354,9 +415,11 @@ test("each card shows its own window, whichever one is selected", async () => {
 	const { exports, render } = await loadBundle();
 	const tree = render(exports.StatRow, { data: payload(), range: "today", onRange() {}, translate: T });
 	const text = textOf(tree);
-	assert.ok(text.includes("30,781"), "today");
-	assert.ok(text.includes("47,085"), "this month");
-	assert.ok(text.includes("77,866"), "all time");
+	// Token figures render compact (30.8K, not 30,781); the full number stays
+	// readable in the card's tooltip.
+	assert.ok(text.includes("30.8K"), "today");
+	assert.ok(text.includes("47.1K"), "this month");
+	assert.ok(text.includes("77.9K"), "all time");
 	const on = findAll(tree, "tkl_stat").filter((c) => "data-on" in c.props);
 	assert.equal(on.length, 1, "exactly one card reads as selected");
 });
@@ -471,7 +534,7 @@ test("hovering a day shows what ran, not just how much", async () => {
 		})
 	);
 	assert.ok(text.includes("2026-08-14"));
-	assert.ok(text.includes("47,085"));
+	assert.ok(text.includes("47.1K"));
 	assert.ok(text.includes("deepseek-v4-pro"));
 	assert.ok(text.includes("85%"), "each model's share of that day");
 	assert.ok(text.includes("activity.level:4"));
@@ -544,8 +607,8 @@ test("the model table carries request counts, so a hit rate can be read", async 
 	const text = textOf(render(exports.ModelTable, { data: payload(), translate: T }));
 	assert.ok(text.includes("40.3%"));
 	assert.ok(text.includes("11.7%"));
-	assert.ok(text.includes("27,492"));
-	assert.ok(text.includes("30,781"), "total reconciles input, cache and output with the site row");
+	assert.ok(text.includes("27.5K"));
+	assert.ok(text.includes("30.8K"), "total reconciles input, cache and output with the site row");
 	assert.ok(text.includes("table.total"));
 });
 
@@ -598,6 +661,65 @@ test("a relay balance renders through the same card as the vendor's", async () =
 	);
 	assert.ok(quotaOnly.includes("balance.quota:4,000,000"));
 	assert.equal(quotaOnly.includes("¥"), false, "money must not be invented from an unknown scale");
+});
+
+test("a spent figure rides under the status when the amount is what is left", async () => {
+	const { exports, render } = await loadBundle();
+	const wallet = textOf(
+		render(exports.BalanceCard, {
+			state: {
+				status: "ready",
+				data: {
+					ok: true,
+					displayName: "r.example",
+					scheme: "newapi",
+					supported: true,
+					fetched: true,
+					isAvailable: true,
+					currency: "CNY",
+					total: 40,
+					used: 180,
+					userToken: true
+				}
+			},
+			translate: T
+		})
+	);
+	assert.ok(wallet.includes("balance.spentAmount:¥180.00"), "已用 rides in the meta beside the status");
+
+	// An unlimited key's card LEADS with the spent figure — a second line
+	// would say it twice.
+	const unlimited = textOf(
+		render(exports.BalanceCard, {
+			state: {
+				status: "ready",
+				data: {
+					ok: true,
+					displayName: "r.example",
+					scheme: "newapi",
+					supported: true,
+					fetched: true,
+					unlimited: true,
+					used: 180,
+					currency: "CNY"
+				}
+			},
+			translate: T
+		})
+	);
+	assert.equal(unlimited.split("balance.spent").length - 1, 1, "the spent figure is not stated twice");
+});
+
+test("a failure with no reason never renders empty parentheses", async () => {
+	const { exports, render } = await loadBundle();
+	const empty = textOf(
+		render(exports.BalanceCard, {
+			state: { status: "ready", data: { ok: true, scheme: "newapi", supported: true, fetched: false, reason: "" } },
+			translate: T
+		})
+	);
+	assert.ok(empty.includes("balance.failedPlain"), "the plain failure line is used");
+	assert.equal(empty.includes("balance.failed:"), false, "an empty reason must not print （）");
 });
 
 test("an unrecognised route is its own row, not folded into direct", async () => {
