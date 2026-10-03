@@ -254,7 +254,7 @@ test("disabling the legacy command leaves HTTP and the legacy service intact", a
 	assert.deepEqual([...published.keys()], ["tokenLedger"]);
 	assert.deepEqual(
 		routes.map((route) => route.path).sort(),
-		["/api/tokenledger/balance", "/api/tokenledger/usage", "/api/tokenledger/userauth"]
+		["/api/tokenledger/balance", "/api/tokenledger/sync-zcode", "/api/tokenledger/usage", "/api/tokenledger/userauth"]
 	);
 	await dispose();
 });
